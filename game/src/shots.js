@@ -1,79 +1,91 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// Neon Bay — the screenshot scenes behind ?shot=start|drive|chase|mission.
+// Each one plays the real rules forward from a fresh seeded world, steered by
+// a simple autopilot that drives the road grid toward a target, so the frame
+// is what real play looks like and the same seed always gives the same frame.
+import { STEP } from './config.js';
+import { createGame, stepGame } from './game.js';
+import { startMission } from './missions.js';
+import { enterCar } from './player.js';
+import { followRoute, planRoute } from './traffic.js';
+import { raiseWanted } from './police.js';
+import { SCREEN_PLAY, SCREEN_TITLE } from './render.js';
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
+const SAMPLE = STEP;
 
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
+/** Put the player in the nearest parked car, the way the E key would. */
+function getInCar(state) {
+  let best = null;
+  let bestD = Infinity;
+  for (const car of state.cars) {
+    if (car.parked) {
+      const d = Math.hypot(car.x - state.player.x, car.y - state.player.y);
+      if (d < bestD) { bestD = d; best = car; }
     }
   }
-  return Infinity;
-}
-
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
-  }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
-    }
+  if (best) {
+    state.player.x = best.x - 30;
+    state.player.y = best.y;
+    enterCar(state, best);
   }
   return best;
 }
 
+/** Drive the player's car through a list of targets for `seconds`, moving on
+ * to the next target whenever one is reached, so the car never just sits. */
+function driveFor(state, targets, seconds) {
+  const car = state.player.car;
+  if (!car) return;
+  let ti = 0;
+  let route = planRoute(car.x, car.y, targets[ti].x, targets[ti].y);
+  let replan = 0;
+  const steps = Math.floor(seconds / SAMPLE);
+  for (let i = 0; i < steps; i += 1) {
+    replan -= SAMPLE;
+    if (route.length === 0) {
+      ti = (ti + 1) % targets.length;
+      route = planRoute(car.x, car.y, targets[ti].x, targets[ti].y);
+    }
+    if (replan <= 0) {
+      route = planRoute(car.x, car.y, targets[ti].x, targets[ti].y);
+      replan = 2;
+    }
+    const input = followRoute(car, route, state);
+    stepGame(state, input, SAMPLE);
+    if (state.over) break;
+  }
+}
+
 /**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
+ * Set `state` to the named scene and return the screen to draw over it.
+ * start: the title over a living city. drive: Rook in a stolen car on the
+ * road. chase: a 3-star pursuit with patrol cars closing in. mission: the
+ * Courier Run in progress, marker and objective on the HUD.
  */
-export function stageShot(name, world) {
-  world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+export function stageShot(name, state) {
+  if (name === 'start') {
+    for (let i = 0; i < 5 / SAMPLE; i += 1) stepGame(state, {}, SAMPLE);
+    return { screen: SCREEN_TITLE };
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
+  if (name === 'drive') {
+    getInCar(state);
+    // Four seconds: mid-straight at full speed, not mid-turn.
+    driveFor(state, [{ x: 2970, y: 570 }, { x: 570, y: 2070 }, { x: 3270, y: 2370 }], 4);
+    return { screen: SCREEN_PLAY };
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+  if (name === 'chase') {
+    getInCar(state);
+    raiseWanted(state, 3);
+    // Five seconds: flat out west with four patrol cars closing in.
+    driveFor(state, [{ x: 570, y: 2070 }, { x: 3270, y: 570 }, { x: 2970, y: 2370 }], 5);
+    return { screen: SCREEN_PLAY };
+  }
+  if (name === 'mission') {
+    getInCar(state);
+    startMission(state, 2);
+    // Four seconds: still en route, banner and marker live, timer counting down.
+    driveFor(state, [{ x: 3180, y: 2100 }], 4);
+    return { screen: SCREEN_PLAY };
+  }
+  for (let i = 0; i < 5 / SAMPLE; i += 1) stepGame(state, {}, SAMPLE);
+  return { screen: SCREEN_TITLE };
 }
