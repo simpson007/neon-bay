@@ -1,2 +1,3 @@
+# Neon Bay: ignore local build outputs
 out/
 node_modules/
